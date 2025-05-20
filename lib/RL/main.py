@@ -1,60 +1,154 @@
+from __future__ import annotations
+
 import argparse
 import os
+
+import networkx as nx
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, global_mean_pool, HeteroConv, SAGEConv
-
+from torch import nn
+from torch_geometric.nn import global_mean_pool, RGCNConv
+from torch_geometric.data import Data, Batch
 from utils import build_sample, predict_single, load_nx_graph
 
 
-class BasicGNN(torch.nn.Module):
-    def __init__(self, hidden_dim: int = 64):
+def nx_to_data(
+    G,
+    node_vocab: dict[str, int],
+    edge_vocab: dict[str, int],
+    node_attr: str = "label",
+    edge_attr: str = "label",
+) -> Data:
+    """
+    • Works even when nodes have *no* 'label' attribute (like your DOT files).
+    • Relabels nodes to 0…N-1 so PyG doesn’t choke on 64-bit IDs.
+    """
+    # 1 ▷ make node ids contiguous
+    G = nx.convert_node_labels_to_integers(
+        G, label_attribute="orig_id"
+    )  # keeps a copy of original id
+
+    # 2 ▷ tokenise nodes
+    for _, d in G.nodes(data=True):
+        raw = d.get(node_attr, str(d["orig_id"]))  # fallback to original id
+        d["token_id"] = node_vocab.setdefault(raw, len(node_vocab))
+
+    # 3 ▷ tokenise edges
+    edge_index, edge_type = [], []
+    for u, v, d in G.edges(data=True):
+        rel = d.get(edge_attr, "UNK_EDGE")
+        rel_id = edge_vocab.setdefault(rel, len(edge_vocab))
+        edge_index.append([u, v])
+        edge_type.append(rel_id)
+
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    edge_type = torch.tensor(edge_type, dtype=torch.long)
+    x = torch.tensor([d["token_id"] for _, d in G.nodes(data=True)], dtype=torch.long)
+
+    return Data(x=x, edge_index=edge_index, edge_type=edge_type)
+
+
+class GraphEncoder(nn.Module):
+    def __init__(
+        self,
+        num_nodes: int,
+        num_edges: int,
+        emb_dim: int = 64,
+        hidden: int = 128,
+        num_layers: int = 2,
+    ):
         super().__init__()
-        self.g1 = GCNConv(-1, hidden_dim)
-        self.g2 = GCNConv(hidden_dim, hidden_dim)
-        self.out = torch.nn.Linear(hidden_dim + 1, 1)
+        self.node_emb = nn.Embedding(num_nodes, emb_dim)
+        self.rel_emb = nn.Embedding(num_edges, emb_dim)  # for basis-decomposition trick
 
-    def forward(self, data):
-        x = F.relu(self.g1(data.x, data.edge_index))
-        x = F.relu(self.g2(x, data.edge_index))
-        pooled = global_mean_pool(x, data.batch)  # [B, H]
-        z = torch.cat([pooled, data.depth.unsqueeze(-1)], dim=-1)
-        return self.out(z).squeeze(-1)
-
-
-class HeteroGNN(torch.nn.Module):
-    def __init__(self, hidden_dim: int = 64):
-        super().__init__()
-        self.convs = torch.nn.ModuleList(
-            [
-                HeteroConv(
-                    {
-                        ("state", "to", "state"): GCNConv(-1, hidden_dim),
-                        ("goal", "to", "goal"): GCNConv(-1, hidden_dim),
-                        ("state", "matches", "goal"): SAGEConv((-1, -1), hidden_dim),
-                        ("goal", "rev_matches", "state"): SAGEConv(
-                            (-1, -1), hidden_dim
-                        ),
-                    },
-                    aggr="mean",
+        self.convs = nn.ModuleList()
+        in_dim = emb_dim
+        for _ in range(num_layers):
+            self.convs.append(
+                RGCNConv(
+                    in_dim,
+                    hidden,
+                    num_relations=num_edges,
+                    num_bases=min(30, num_edges),
                 )
-                for _ in range(2)
-            ]
-        )
-        self.out = torch.nn.Linear(2 * hidden_dim + 1, 1)
+            )
+            in_dim = hidden
 
-    def forward(self, data):
-        x_dict, ei_dict = data.x_dict, data.edge_index_dict
+    def forward(self, data: Data | Batch):
+        x = self.node_emb(data.x)
         for conv in self.convs:
-            x_dict = conv(x_dict, ei_dict)
-        s = global_mean_pool(x_dict["state"], data["state"].batch)  # [B,H]
-        g = global_mean_pool(x_dict["goal"], data["goal"].batch)  # [B,H]
-        z = torch.cat([s, g, data.depth.unsqueeze(-1)], dim=-1)
-        return self.out(z).squeeze(-1)
+            x = F.relu(conv(x, data.edge_index, data.edge_type))
+        return global_mean_pool(x, data.batch)  # [B, hidden]
 
 
-def _make_model(if_use_goal: bool):
-    return HeteroGNN() if if_use_goal else BasicGNN()
+class HeuristicModel(nn.Module):
+    def __init__(
+        self,
+        vocab_state_nodes: int,
+        vocab_state_edges: int,
+        vocab_goal_nodes: int,
+        vocab_goal_edges: int,
+        emb_dim=64,
+        hidden=128,
+        cross_dim=32,
+        depth_mode="scalar+emb",
+        vocabulary_size: int = 512,
+        embedding_dim: int = 8,
+    ):  # "scalar", "emb", "scalar+emb"
+        super().__init__()
+
+        self.enc_state = GraphEncoder(
+            vocab_state_nodes, vocab_state_edges, emb_dim, hidden
+        )
+        self.enc_goal = GraphEncoder(
+            vocab_goal_nodes, vocab_goal_edges, emb_dim, hidden
+        )
+
+        self.cross = nn.Bilinear(hidden, hidden, cross_dim)
+
+        self.depth_mode = depth_mode
+        if "emb" in depth_mode:
+            self.vocabulary_size = vocabulary_size
+            self.embedding_dim = embedding_dim
+            self.depth_emb = nn.Embedding(
+                vocabulary_size, embedding_dim
+            )  # expand if deeper trees
+
+        in_dim = hidden + hidden + cross_dim
+        if depth_mode == "scalar":
+            in_dim += 1
+        elif depth_mode == "emb":
+            in_dim += self.embedding_dim
+        elif depth_mode == "scalar+emb":
+            in_dim += 1 + self.embedding_dim
+
+        self.head = nn.Sequential(nn.Linear(in_dim, 64), nn.ReLU(), nn.Linear(64, 1))
+
+    def forward(self, data_s, data_g, depth):
+        hs = self.enc_state(data_s)  # [B, hidden]
+        hg = self.enc_goal(data_g)  # [B, hidden]
+        cross = self.cross(hs, hg)  # [B, cross_dim]
+
+        depth_feats = []
+        if "scalar" in self.depth_mode:
+            depth_feats.append(depth.float().unsqueeze(-1))  # [B,1]
+        if "emb" in self.depth_mode:
+            depth_feats.append(
+                self.depth_emb(depth.clamp_max(self.vocabulary_size - 1))
+            )  # [B,8]
+
+        z = torch.cat([hs, hg, cross, *depth_feats], dim=-1)
+        return self.head(z).squeeze(-1)  # [B]
+
+
+def _make_model(vocabs):
+    return HeuristicModel(
+        vocab_state_nodes=len(vocabs["state_node_vocab"]),
+        vocab_state_edges=len(vocabs["state_edge_vocab"]),
+        vocab_goal_nodes=len(vocabs["goal_node_vocab"]),
+        vocab_goal_edges=len(vocabs["goal_edge_vocab"]),
+        depth_mode="scalar+emb",
+    )
 
 
 def main_prediction() -> None:
@@ -71,30 +165,19 @@ def main_prediction() -> None:
         type=str,
         help="The file containing the goal description in graph format",
     )
+    parser.add_argument("state_repr", type=str, help="State representation: M/H")
     args = parser.parse_args()
 
-    # TODO: with need to know if we are working with/without hashing and with/without gaol
     USE_GOAL = True
-    USE_HASH = True
 
-    # Giovanni I've added the parsing of the goal file path as well. This does not need to be executed on every run for
-    # the prediction as it is shared in the problem adding compilation error so you notice this line above:)
+    state_repr = args.state_repr
+    USE_HASH = True if state_repr == "H" else False
 
     s_dot_path = args.path
-
     G_s = load_nx_graph(s_dot_path, False)
 
-    subdir = s_dot_path.split("out/state/")[1].split("/")[0]
+    subdir = "new_" + s_dot_path.split("out/state/")[1].split("/")[0]
     model_dir = os.path.join("lib", "RL", "results", subdir)
-
-    if USE_GOAL:
-        # g_dot_path = args.goal_file
-        g_dot_path = (
-            "lib/RL/results/CC_3_2_3__pl_6_poss_hashing_goal/CC_3_2_3__pl_6_goal_tree.dot"
-        )
-        G_g = load_nx_graph(g_dot_path, True)
-    else:
-        G_g = None
 
     if USE_HASH:
         model_dir += "_hashing"
@@ -106,20 +189,37 @@ def main_prediction() -> None:
     else:
         model_dir += "_nogoal"
 
-    model_file = os.path.join(model_dir, "gnn_predictor.pt")
+    if USE_GOAL:
+        g_dot_path = model_dir + args.goal_file.split("out/ML_HEUR_datasets/DFS")[1]
+        G_g = load_nx_graph(g_dot_path, True)
+    else:
+        G_g = None
 
-    model = _make_model(USE_GOAL)
-    model.load_state_dict(torch.load(model_file, map_location=device))
+    path_vocabs = os.path.join(model_dir, "vocabularies.pt")
+    vocabs = torch.load(path_vocabs)
+    state_dict_path = os.path.join(model_dir, "heuristic_model_state.pt")
+
+    model = _make_model(vocabs)
+    model.load_state_dict(torch.load(state_dict_path, map_location=device))
     model.to(device)
+    model.eval()
 
-    # 4) Predict
-    depth = int(args.depth)
-    sample = build_sample(G_s, depth, None, G_g)
-    pred_value = predict_single(sample, model, device=device)
+    # build your Data objects
+    data_s = nx_to_data(G_s, vocabs["state_node_vocab"], vocabs["state_edge_vocab"])
+    data_g = nx_to_data(G_g, vocabs["goal_node_vocab"], vocabs["goal_edge_vocab"])
+    depth = torch.tensor([args.depth], dtype=torch.long)
+
+    # batch and move to device
+    batch_s = Batch.from_data_list([data_s]).to(device)
+    batch_g = Batch.from_data_list([data_g]).to(device)
+    depth = depth.to(device)
+
+    # now everything lines up: all tensors + model on cuda
+    pred = int(model(batch_s, batch_g, depth).item())
 
     # 5) Output
     with open("prediction.tmp", "w", encoding="utf-8") as fp:
-        fp.write(f"VALUE:{pred_value}\n")
+        fp.write(f"VALUE:{pred}\n")
 
 
 if __name__ == "__main__":
