@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import global_mean_pool, RGCNConv
 from torch_geometric.data import Data, Batch
-from utils import build_sample, predict_single, load_nx_graph
+from utils import load_nx_graph
 
 
 def nx_to_data(
@@ -141,13 +141,13 @@ class HeuristicModel(nn.Module):
         return self.head(z).squeeze(-1)  # [B]
 
 
-def _make_model(vocabs):
+def _make_model(vocabs, depth_mode: str = "scalar"):
     return HeuristicModel(
         vocab_state_nodes=len(vocabs["state_node_vocab"]),
         vocab_state_edges=len(vocabs["state_edge_vocab"]),
         vocab_goal_nodes=len(vocabs["goal_node_vocab"]),
         vocab_goal_edges=len(vocabs["goal_edge_vocab"]),
-        depth_mode="scalar+emb",
+        depth_mode=depth_mode,
     )
 
 
